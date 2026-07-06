@@ -1290,6 +1290,7 @@ name = "simplicity_ctf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bip39",
  "smplx-std",
 ]
 
