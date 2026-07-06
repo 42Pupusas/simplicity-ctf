@@ -96,6 +96,14 @@ here (that is what makes single-sig replay valid).
   Rust build_tapbranch/build_taptweak per (word × packing) → decode all 12 slots instantly.
   This is a dictionary decode of a known commitment, NOT a 256-bit brute force.
 
+## ==================== DRAINED ✅ BROADCAST ACCEPTED ON MAINNET ====================
+# drain txid = d42f6bc30f4eac43fbe5dcd11552754307150c7654a4867a2019f31cbedf30d3
+# 13 inputs (reward vout12 + 12 tokens) all covenant-validated by the node.
+# out0=12 AUTH->owner, out1=~999000 sats L-BTC->user VJL address, fee=389.
+# Run: SIMPLEX_TEST_ENV=Simplex.toml cargo test --test your_solution solution -- --nocapture
+# (Simplex.toml: flat TestConfig, verbosity="Debug" REQUIRED, [esplora] blockstream liquid.)
+# DRAIN_DRY_RUN=1 env => finalize-only (local BitMachine validate, no broadcast).
+
 ## ==================== SOLVED ✅ OWNER KEY RECOVERED ====================
 # MNEMONIC (vout order, BIP39 checksum VALID): "hole art knife walnut language cool borrow
 #   board rival silk october boy"

@@ -1,31 +1,10 @@
-# DEFAULT CONFIG 
+# CTF drain config parsed directly as TestConfig (FLAT — no [test] wrapper).
+# verbosity = 1 (Debug) REQUIRED so covenant CMRs include debug symbols and
+# match the on-chain taproot addresses.
+mnemonic = "hole art knife walnut language cool borrow board rival silk october boy"
+bitcoins = 0
+verbosity = "Debug"
 
-# [build]
-# src_dir = "./simf"
-# simf_files = ["*.simf"]
-# out_dir = "./src/artifacts"
-
-# [dependencies]
-# some_dep = { git = "<git url>", path = "<or a relative path>" } 
-
-# [regtest]
-# mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
-# bitcoins = 10_000_000
-# rpc_port = 18443
-# esplora_port = 3000
-# rpc_user = "user"
-# rpc_password = "password"
-
-# [test]
-# mnemonic = "exist carry drive collect lend cereal occur much tiger just involve mean"
-# bitcoins = 10_000_000
-# verbosity = 0
-
-# [test.esplora]
-# url = "<esplora url>"
-# network = "<Liquid, LiquidTestnet, ElementsRegtest>"
-
-# [test.rpc]
-# url = "<rpc url>"
-# username = "<rpc username>"
-# password = "<rpc password>"
+[esplora]
+url = "https://blockstream.info/liquid/api"
+network = "Liquid"

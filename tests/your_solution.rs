@@ -31,9 +31,9 @@
 //! can sweep quickly. Theory: the 12 nonces encode a 12-word BIP39 mnemonic → owner privkey.
 
 use simplicity_ctf::artifacts::ctf::CtfProgram;
-use simplicity_ctf::artifacts::ctf::derived_ctf::CtfArguments;
+use simplicity_ctf::artifacts::ctf::derived_ctf::{self, CtfArguments};
 use simplicity_ctf::artifacts::asset_lock::AssetLockProgram;
-use simplicity_ctf::artifacts::asset_lock::derived_asset_lock::AssetLockArguments;
+use simplicity_ctf::artifacts::asset_lock::derived_asset_lock::{self, AssetLockArguments};
 
 use simplex::provider::SimplicityNetwork;
 
@@ -408,14 +408,117 @@ fn recover_owner_key() -> anyhow::Result<()> {
 
 // ─────────────────────────── solution (runs under simplex) ───────────────────────────
 
+/// Decoded mnemonic words in vout order (token vout -> BIP39 word / nonce).
+const TOKEN_WORDS: [&str; 12] = [
+    "hole", "art", "knife", "walnut", "language", "cool",
+    "borrow", "board", "rival", "silk", "october", "boy",
+];
+
+/// nonce = word ASCII bytes, big-endian, LEFT-aligned in the low u64 ("left_be").
+fn word_nonce(word: &str) -> u64 {
+    let w = word.as_bytes();
+    assert!(w.len() <= 8);
+    let mut b = [0u8; 8];
+    b[..w.len()].copy_from_slice(w);
+    u64::from_be_bytes(b)
+}
+
+/// Destination for the drained 0.01 L-BTC reward (user-supplied Liquid mainnet address).
+const REWARD_DEST: &str =
+    "VJLJwHeE713aSHcQX3Vh7HgH5C2CidwkhWpbf8Rm28JyDQR2VbAq6Aner52xorAq2AZ8re9RMJzWkUy3";
+
+const REWARD_TXID: &str = "aa52a138a0e193c8530e1195b201c7139de194decc0ff3bb01489adbe814095c";
+
 #[simplex::test]
 fn solution(context: simplex::TestContext) -> anyhow::Result<()> {
-    let _network = context.get_network();
-    // Drain plan once owner key is recovered:
-    //   input  0      = ctf reward vout12   → current_index()==0
-    //   inputs 1..=12 = asset_lock tokens   → asset_lock never checks its index
-    //   output 0      = 12 AUTH units       → ctf output_amount(0)==12
-    //   output 1      = 1_000_000 sats L-BTC → us
-    // Sign each input under OWNER_PUBKEY over its own sig_all_hash (index+CMR bound).
+    use simplex::simplicityhl::elements::{Address, AssetId};
+    use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature};
+    use std::str::FromStr;
+
+    let net = context.get_network().clone();
+    // Signer built from the recovered owner mnemonic (config uses the same phrase).
+    let owner_signer = context.create_signer(TOKEN_WORDS.join(" ").as_str());
+    let provider = owner_signer.get_provider();
+
+    let owner = hex32(OWNER_OP_RETURN)?;
+    let auth_asset = AssetId::from_str(AUTH_ASSET_ID)?;
+
+    // Sanity: our derived owner key must match OWNER_PUBKEY.
+    anyhow::ensure!(
+        owner_signer.get_schnorr_public_key().serialize() == owner,
+        "signer x-only pubkey != OWNER_PUBKEY"
+    );
+    eprintln!("[drain] owner key OK; assembling tx on {net:?}");
+
+    let mut ft = FinalTransaction::new();
+
+    // ---- input 0: ctf reward (vout 12) ----
+    let ctf = CtfProgram::new(CtfArguments { owner_pubkey: owner, auth_asset_id: auth_asset_le() });
+    let ctf_spk = ctf.get_script_pubkey(&net);
+    let ctf_utxos = provider.fetch_scripthash_utxos(&ctf_spk)?;
+    let reward_txid = simplex::simplicityhl::elements::Txid::from_str(REWARD_TXID)?;
+    let reward_utxo = ctf_utxos.into_iter()
+        .find(|u| u.outpoint.txid == reward_txid && u.outpoint.vout == 12)
+        .ok_or_else(|| anyhow::anyhow!("ctf reward UTXO (vout12) not found / already spent"))?;
+    let reward_amount = reward_utxo.amount();
+    eprintln!("[drain] reward utxo {}:{} = {} sats L-BTC", reward_utxo.outpoint.txid, reward_utxo.outpoint.vout, reward_amount);
+    let ctf_witness = derived_ctf::CtfWitness { signature: [0u8; 64] };
+    ft.add_program_input(
+        PartialInput::new(reward_utxo),
+        ProgramInput::new(Box::new(std::convert::AsRef::<simplex::program::Program>::as_ref(&ctf).clone()), Box::new(ctf_witness)),
+        RequiredSignature::Witness("SIGNATURE".to_string()),
+    );
+
+    // ---- inputs 1..=12: the 12 asset_lock tokens ----
+    for (vout, word) in TOKEN_WORDS.iter().enumerate() {
+        let nonce = word_nonce(word);
+        let mut al = AssetLockProgram::new(AssetLockArguments { owner_pubkey: owner })
+            .with_storage_capacity(1);
+        let _ = al.set_storage_at(0, nonce_slot_value(nonce));
+        let spk = al.get_script_pubkey(&net);
+        let utxos = provider.fetch_scripthash_utxos(&spk)?;
+        let tok = utxos.into_iter()
+            .find(|u| u.outpoint.vout as usize == vout && u.outpoint.txid == reward_txid)
+            .or_else(|| None)
+            .ok_or_else(|| anyhow::anyhow!("token vout{vout} ({word}) UTXO not found"))?;
+        eprintln!("[drain] token vout{vout:2} {word:9} nonce={nonce:#018x} -> utxo {}:{}", tok.outpoint.txid, tok.outpoint.vout);
+        let wtns = derived_asset_lock::AssetLockWitness { signature: [0u8; 64], nonce };
+        ft.add_program_input(
+            PartialInput::new(tok),
+            ProgramInput::new(Box::new(std::convert::AsRef::<simplex::program::Program>::as_ref(&al).clone()), Box::new(wtns)),
+            RequiredSignature::Witness("SIGNATURE".to_string()),
+        );
+    }
+
+    // ---- output 0: the 12 AUTH units, back to the owner address (covenant requires 12 @ AUTH) ----
+    let owner_addr = owner_signer.get_address();
+    ft.add_output(PartialOutput::new(owner_addr.script_pubkey(), 12, auth_asset));
+
+    // ---- output 1: the reward L-BTC to the user's address (minus fee, handled by finalize) ----
+    let dest = Address::from_str(REWARD_DEST)?;
+    // Leave a small margin for fee; finalize/broadcast recomputes the exact fee from the delta.
+    let fee_budget = 1_000u64;
+    let reward_out = reward_amount.checked_sub(fee_budget)
+        .ok_or_else(|| anyhow::anyhow!("reward too small to cover fee"))?;
+    let mut reward_output = PartialOutput::new(dest.script_pubkey(), reward_out, net.policy_asset());
+    if let Some(bk) = dest.blinding_pubkey {
+        reward_output = reward_output.with_blinding_key(
+            simplex::simplicityhl::elements::bitcoin::PublicKey::new(bk),
+        );
+    }
+    ft.add_output(reward_output);
+
+    if std::env::var("DRAIN_DRY_RUN").is_ok() {
+        // Validate + sign locally (runs the BitMachine over every covenant input) WITHOUT broadcast.
+        let (tx, fee) = owner_signer.finalize(&ft)?;
+        eprintln!("[drain] DRY-RUN ok: signed & covenant-validated. fee={fee} sats");
+        eprintln!("[drain] txid = {}", tx.txid());
+        eprintln!("[drain] out0 = 12 AUTH -> owner, out1 = {reward_out} sats -> user");
+        return Ok(());
+    }
+
+    eprintln!("[drain] broadcasting: out0 = 12 AUTH -> owner, out1 = {reward_out} sats -> {REWARD_DEST}");
+    let receipt = owner_signer.broadcast(&ft)?;
+    eprintln!("[drain] ✅ BROADCAST OK txid = {:?}", receipt);
     Ok(())
 }
