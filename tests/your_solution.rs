@@ -17,7 +17,14 @@
 //! - ABI (confirmed): ctf params {AUTH_ASSET_ID: u256, OWNER_PUBKEY: u256}, witness
 //!   {SIGNATURE: [u8;64]}; asset_lock params {OWNER_PUBKEY: u256}, witness {SIGNATURE, NONCE}.
 //!
-//! ## Open: decode the 12 token nonces
+//! ## SOLVED — owner key recovered
+//! The 12 asset_lock nonces each encode a BIP39 word as ASCII bytes, LEFT-aligned big-endian in
+//! the low u64 (slot value = BE32 with word bytes at offset 24). Decoded (vout order):
+//!   hole art knife walnut language cool borrow board rival silk october boy
+//! Valid BIP39 checksum. Derives OWNER_PUBKEY e2d2636e… at path m/84h/1776h/0h/0/0.
+//! OWNER PRIVKEY = 476f8dcb2d92a8ac9d5962b02e68dc445553f98a56cdf24c71aa5a742c68bf5b
+//!
+//! ## (historical) decode the 12 token nonces
 //! Each token (vout 0..11) is an `asset_lock` covenant whose hidden taproot slot commits to a
 //! `nonce: u64` (slot value = BE32(nonce)). Word-index (0..2047) hypothesis is RULED OUT.
 //! `fast_asset_lock_key` reconstructs a token address from the leaf CMR (compiled once) so we
@@ -198,17 +205,34 @@ fn decode_nonces_fast() -> anyhow::Result<()> {
     enable_debug_symbols();
     let owner = hex32(OWNER_OP_RETURN)?;
     let leaf = asset_lock_leaf_script(owner)?;
-    let mut decoded: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
-    for nonce in 0u64..5_000_000 {
-        let key = fast_asset_lock_key(&leaf, nonce_slot_value(nonce));
-        if let Some(v) = match_onchain(&key) {
-            if v < 12 {
-                eprintln!("[decode] vout{v:2} <- nonce {nonce}");
-                decoded.insert(v, nonce);
-                if decoded.len() == 12 { break; }
+    let start: u64 = std::env::var("NONCE_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max: u64 = std::env::var("NONCE_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+    let threads: u64 = std::env::var("NONCE_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    eprintln!("[decode] sweeping {start}..{max} across {threads} threads");
+    let leaf = std::sync::Arc::new(leaf);
+    let found = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<u32,u64>::new()));
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let leaf = leaf.clone();
+        let found = found.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut n = start + t;
+            while n < max {
+                let key = fast_asset_lock_key(&leaf, nonce_slot_value(n));
+                if let Some(v) = match_onchain(&key) {
+                    if v < 12 {
+                        let mut f = found.lock().unwrap();
+                        if f.insert(v, n).is_none() {
+                            eprintln!("[decode] vout{v:2} <- nonce {n} (0x{n:x})");
+                        }
+                    }
+                }
+                n += threads;
             }
-        }
+        }));
     }
+    for h in handles { let _ = h.join(); }
+    let decoded = found.lock().unwrap().clone();
     eprintln!("[decode] {}/12: {decoded:?}", decoded.len());
     Ok(())
 }
@@ -292,6 +316,93 @@ fn derive_owner_key() -> anyhow::Result<()> {
             eprintln!("[derive] OWNER PRIVKEY = {}", hex_encode(&child.private_key.secret_bytes()));
         }
     }
+    Ok(())
+}
+
+/// Full BIP39 wordlist ASCII-packing sweep: each nonce may be a word's ASCII bytes packed into
+/// a u64. Test all 2048 words x packings x 12 slots. A hit proves the mnemonic-encoding theory.
+#[test]
+fn decode_words_full() -> anyhow::Result<()> {
+    enable_debug_symbols();
+    let owner = hex32(OWNER_OP_RETURN)?;
+    let leaf = asset_lock_leaf_script(owner)?;
+
+    // Precompute all on-chain token keys -> vout.
+    let words = bip39::Language::English.word_list();
+
+    // Candidate u64 packings of a word's ASCII bytes (word len <= 8).
+    type Pack = (&'static str, fn(&[u8]) -> Option<u64>);
+    let packings: [Pack; 4] = [
+        ("right_be", |w| { if w.len()>8 {return None;} let mut b=[0u8;8]; b[8-w.len()..].copy_from_slice(w); Some(u64::from_be_bytes(b)) }),
+        ("left_be",  |w| { if w.len()>8 {return None;} let mut b=[0u8;8]; b[..w.len()].copy_from_slice(w); Some(u64::from_be_bytes(b)) }),
+        ("right_le", |w| { if w.len()>8 {return None;} let mut b=[0u8;8]; b[8-w.len()..].copy_from_slice(w); Some(u64::from_le_bytes(b)) }),
+        ("left_le",  |w| { if w.len()>8 {return None;} let mut b=[0u8;8]; b[..w.len()].copy_from_slice(w); Some(u64::from_le_bytes(b)) }),
+    ];
+
+    let mut hits = 0;
+    for (pn, pack) in packings {
+        for (wi, w) in words.iter().enumerate() {
+            let Some(nonce) = pack(w.as_bytes()) else { continue; };
+            let key = fast_asset_lock_key(&leaf, nonce_slot_value(nonce));
+            if let Some(v) = match_onchain(&key) {
+                eprintln!("[words] vout{v:2} <- word[{wi}] {w:?} packing={pn} nonce=0x{nonce:x}");
+                hits += 1;
+            }
+        }
+    }
+    eprintln!("[words] {hits} hits across all packings");
+    Ok(())
+}
+
+/// Decoded 12 words (vout order). Verify the mnemonic derives OWNER_PUBKEY e2d2636e… and print
+/// the recovered private key. Tries vout-order + reverse, BIP39 valid checksum, common paths.
+#[test]
+fn recover_owner_key() -> anyhow::Result<()> {
+    use bip39::Mnemonic;
+    use simplex::simplicityhl::simplicity::bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+    use simplex::simplicityhl::simplicity::bitcoin::Network;
+    use simplex::simplicityhl::elements::secp256k1_zkp::Secp256k1;
+    use std::str::FromStr;
+
+    // vout -> word, from decode_words_full (left_be packing).
+    let by_vout = [
+        "hole","art","knife","walnut","language","cool",
+        "borrow","board","rival","silk","october","boy",
+    ];
+    let target = hex32(OWNER_OP_RETURN)?;
+    let secp = Secp256k1::new();
+
+    let orders: [(&str, Vec<&str>); 2] = [
+        ("vout_order", by_vout.to_vec()),
+        ("reverse",    by_vout.iter().rev().copied().collect()),
+    ];
+    let paths = [
+        "m","m/0","m/0h","m/0/0","m/0h/0/0","m/44h/0h/0h/0/0",
+        "m/84h/0h/0h/0/0","m/84h/1776h/0h/0/0","m/44h/1776h/0h/0/0","m/86h/0h/0h/0/0",
+    ];
+
+    for (label, words) in &orders {
+        let phrase = words.join(" ");
+        match Mnemonic::parse(&phrase) {
+            Ok(m) => {
+                eprintln!("[recover] {label}: VALID bip39 checksum: {phrase}");
+                let seed = m.to_seed("");
+                let master = Xpriv::new_master(Network::Bitcoin, &seed)?;
+                for p in paths {
+                    let path = DerivationPath::from_str(p)?;
+                    let d = master.derive_priv(&secp, &path)?;
+                    let xpub = Xpub::from_priv(&secp, &d);
+                    let xonly = xpub.public_key.x_only_public_key().0.serialize();
+                    if xonly == target {
+                        eprintln!("[recover] *** MATCH *** order={label} path={p} privkey={}", hex_encode(&d.private_key.secret_bytes()));
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => eprintln!("[recover] {label}: not a valid bip39 phrase: {e}"),
+        }
+    }
+    eprintln!("[recover] no derivation matched OWNER_PUBKEY at tried orders/paths");
     Ok(())
 }
 
